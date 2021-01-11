@@ -1,25 +1,14 @@
-# 2：系统根据上课时间、下课时间，前后几分钟，操作摄像头拍照
-# 	2.1每小时拉取服务器今天所上课程；
-# 	2.2根据课程找到班级所在摄像头；
-# 	2.3设置定时任务，在上课10分钟内，多次调用摄像头人脸识别
-# 	2.4人脸识别成功后，
-# 		打印识别人员名单，识别人员数量，
-# 		发送签到命令到服务器，给识别成功人员登记考勤
-# 		手机小程序，推送签到成功给手机端(顾问、老师、家长)
 import datetime
-
-import pytz
 import requests
 import json
 import cv2
 import face_recognition
-import time
-from pytz import utc
-from apscheduler.schedulers.background import BackgroundScheduler
+import time, os.path
+import xlwings as xw
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.executors.pool import ProcessPoolExecutor, ThreadPoolExecutor
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_ADDED
-# 鉴于人脸识别需要大量计算，此处使用多进程
+
 executors = {
     'default': ThreadPoolExecutor(20),
     'processpool': ProcessPoolExecutor(5)
@@ -29,6 +18,7 @@ job_defaults = {
     'max_instances': 3
 }
 scheduler = BlockingScheduler()
+videos_path = '/Users/zy/Desktop/Git/CameraFaceSign/face_video/'
 
 
 def get_beijing_time():
@@ -49,6 +39,7 @@ def get_beijing_time():
 
 
 class Student:
+    # 学生姓名和学生脸部特征; 目前没有的话读取的是id
     def __init__(self, name, face):
         self.name = name
         self.face = face
@@ -58,7 +49,7 @@ class Student:
 
 
 class Cam:
-    def __init__(self, cam_name, ip, username, password, port=554):
+    def __init__(self, cam_name, ip, username, password):
         self.cam_name = cam_name
         self.ip = ip
         self.username = username
@@ -78,8 +69,6 @@ class Product:
 
     def pro_desc(self):
         print("pro_id: %s, name: %s, time: %s-%s" % (self.pro_id, self.name, self.startTime, self.endTime))
-        # for cam in self.cams:
-        #     cam.cam_desc()
 
 
 # requests
@@ -97,11 +86,12 @@ task_list = []
 
 def get_course_for_day():
     cur_time = get_beijing_time()
+
     data = {
         'orgId': '7210',
         "customer_id": 'YIJIE_2017_FAKE',
-        "startTime": '1607097751000',
-        'endTime': '1607097751000',
+        "startTime": '1609827018000',
+        'endTime': '1609827018000',
         # "startTime": cur_time,
         # 'endTime': cur_time
     }
@@ -111,46 +101,152 @@ def get_course_for_day():
                                 'JhdWQiOiJqYWN5LmxpdUByZW5lZS1hcnRzLmNvbSJ9.uVUBft-xbe8TL2Wev2JRa_r5mJHIVr4I5REXJdJa_VM'}
     r = requests.get(base_url + product_url, params=data, headers=headers)
     products = json.loads(r.content)
+    print('len(products):%s' % (len(products)))
+
+    app = xw.App(visible=False, add_book=True)
     for pro in products:
         # 序列号课程id、名称、开课时间、下课时间，用于添加计划任务
         base_product = Product(pro['curriculumId'], pro['curriculumId'], pro['startTime'], pro['endTime'])
         base_product.pro_desc()
         # 获取班级学生数据
-        get_course_students(base_product.pro_id)
+        dict_student_name, dict_student_face = get_course_students(base_product.pro_id)
         # 获取当前课程的摄像头
-        # get_course_cams(base_product.pro_id)
+        # cams = get_course_cams(base_product.pro_id)
+        cams = [
+            # {'cam_name': '摄像头1', "ip": '192.168.8.212', "username": 'admin', 'password': 'LEWMHE'},
+                # {'cam_name': '摄像头2', "ip": '192.168.8.216', "username": 'admin', 'password': 'ADTVKL'},
+                {'cam_name': '摄像头3', "ip": '192.168.8.214', "username": 'admin', 'password': 'CLSMKY'}]
         # 当天第二次以后再查询，需筛选重复后，再添加；但是避免添加已过期任务
 
         # 转换时间格式
         start_time = datetime.datetime.fromisoformat(base_product.startTime)
         end_time = datetime.datetime.fromisoformat(base_product.endTime)
+
+        wb = create_xlsx(app, base_product.name, base_product.pro_id, base_product.startTime, dict_student_name)
         # 给每个摄像头添加计划任务；
         # 任务1：每个摄像头开始上课前1分钟开始启动，再次执行：20分钟后
         # 任务2：每个摄像头下课前5分钟启动弄个
-        cams = ['1', '2']
         for cam in cams:
-            cam = Cam('摄像头1', '192.168.1.1', 'admin', '111111')
+            cam_real = Cam(cam['cam_name'], cam['ip'], cam['username'], cam['password'])
             scheduler.add_job(
-                check_face_sign,
+                save_cam_video,
                 trigger='date',
-                run_date=start_time - datetime.timedelta(seconds=1 * 60),
-                next_run_time=start_time + datetime.timedelta(seconds=20 * 60),
-                args=[cam.ip, cam.username, cam.password, pro['curriculumId']]
+                run_date=start_time + datetime.timedelta(seconds=2720 * 60),
+                args=[cam_real.ip, cam_real.cam_name, cam_real.username, cam_real.password,
+                      base_product.pro_id, base_product.pro_id]
             )
-            scheduler.add_job(
-                check_face_sign,
-                trigger='date',
-                run_date=end_time - datetime.timedelta(seconds=5 * 60),
-                args=[cam.ip, cam.username, cam.password, pro['curriculumId']]
-            )
+            # scheduler.add_job(
+            #     save_cam_video,
+            #     trigger='date',
+            #     run_date=start_time + datetime.timedelta(seconds=30 * 60),
+            #     args=[cam_real.ip, cam_real.cam_name, cam_real.username, cam_real.password,
+            #           base_product.pro_id, base_product.pro_id]
+            # )
+            # scheduler.add_job(
+            #     save_cam_video,
+            #     trigger='date',
+            #     run_date=end_time - datetime.timedelta(seconds=5 * 60),
+            #     args=[cam_real.ip, cam_real.cam_name, cam_real.username, cam_real.password,
+            #           base_product.pro_id, base_product.pro_id]
+            # )
             scheduler.print_jobs()
-            print('_'*20)
+            print('_'*40)
+
+            # 添加检测人脸任务,录制视频结束5分钟后
+            # 录制完视频，根据录制视频人脸识别
+            # 录制视频的path
+            # print('添加人脸识别任务' + '-' * 30)
+            # scheduler.add_job(
+            #     check_face,
+            #     trigger='date',
+            #     run_date=start_time + datetime.timedelta(seconds=2700 * 60),
+            #     args=[base_product.pro_id, cam_real.cam_name, dict_student_face, dict_student_name]
+            # )
+            # scheduler.add_job(
+            #     check_face,
+            #     trigger='date',
+            #     run_date=start_time + datetime.timedelta(seconds=35 * 60),
+            #     args=[base_product.pro_id, cam_real.cam_name, dict_student_name, dict_student_face]
+            # )
+            # scheduler.add_job(
+            #     check_face,
+            #     trigger='date',
+            #     run_date=end_time - datetime.timedelta(seconds=5 * 60),
+            #     args=[base_product.pro_id, cam_real.cam_name, dict_student_name, dict_student_face]
+            # )
+            scheduler.print_jobs()
+            print('-'*40)
+
+        # break 是临时测试录制视频使用，只录制一个课程的视频；
+        wb.close()
+        app.quit()
+        break
+
+        # 202101051715_5f520b4c23c5b0e45041cb1c_摄像头1
+
+        # 202101051710_5f520b4c23c5b0e45041cb1c_摄像头1
+        # 202101051710_5f520b4c23c5b0e45041cb1c_摄像头2
 
 
-# 存储学生姓名
-known_face_names = []
-# 存储人脸数据
-known_face_encodings = []
+# 目前把每个录好的视频保存完成
+#     1：展示文件列表所有视频mp4文件
+#     2：视频人脸识别
+#         怎么把视频文件和某个班级关联；
+#         视频文件名称：班级id+上课时间
+#         此外：保存视频的时候最好每天记录1个Excel：
+#             当天时间.excel：班级名称、班级ID、上课时间、班级学生[]
+#     3：识别后发送请求
+#     4.1：发送成功删除视频
+#     4.2：如果不删除，移动视频到另外一个目录；
+def check_face(base_product_id, cam_name, dict_student_face, dict_student_name):
+    """
+    根据传入的视频、学生人脸信息、学生名称检测人脸
+    """
+    # path = '%s%s_%s_%s.mp4' % (videos_path, (datetime.datetime.now()-datetime.timedelta(seconds=2 * 60)).strftime("%Y%m%d%H%M"),
+    #                            base_product_id, cam_name)
+    path = '%s%s_%s_%s.mp4' % (videos_path, "202101061430", "5f520b4c23c5b0e45041cb1c", cam_name)
+    print('人脸识别任务：time: %s Task for %s ' % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path))
+
+    cam = cv2.VideoCapture(path)
+
+    time_count = 0
+    while cam.isOpened():
+        # 读取摄像头画面
+        ret, frame = cam.read()
+        if not ret:
+            # 等同于 if ret is not none
+            print('%s 视频读取不到' % path)
+            break
+
+        # 改变摄像头图像的大小，图像小，所做的计算就少
+        small_frame = cv2.resize(frame, (0, 0), fx=0.33, fy=0.33)
+        # opencv的图像是BGR格式的，而我们需要是的RGB格式的，因此需要进行一个转换。
+        rgb_small_frame = small_frame[:, :, ::-1]
+        if True:
+            # 根据encoding来判断是不是同一个人，是就输出true，不是为flase
+            face_locations = face_recognition.face_locations(rgb_small_frame)
+            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+            face_names = []
+            # 此处可能识别多张脸
+
+            # !!!打印下：是否检测到人脸。然后在看是否是否正确
+            # ufunc 'subtract' did not contain a loop with signature matching types
+            # (dtype('<U32'), dtype('<U32')) -> dtype('<U32')
+            for face_encoding in face_encodings:
+                # 默认为unknown, match人脸
+                # 此处是已经检测出来的人脸，需要多数组比对
+
+                matches = face_recognition.compare_faces(dict_student_face, face_encoding, tolerance=0.48)
+                # 阈值太低容易造成无法成功识别人脸，太高容易造成人脸识别混淆 默认阈值tolerance为0.6
+                name = "Unknown"
+                if True in matches:
+                    first_match_index = matches.index(True)
+                    name = dict_student_name[first_match_index]
+
+                face_names.append(name)
+            # 检测出来所有比对上的人脸
+            time_count = time_count + 1
+            print('time----face_names: %s', (time_count, face_names))
 
 
 def get_course_cams(product_id):
@@ -168,223 +264,102 @@ def get_course_students(product_id):
                                 'JhdWQiOiJqYWN5LmxpdUByZW5lZS1hcnRzLmNvbSJ9.uVUBft-xbe8TL2Wev2JRa_r5mJHIVr4I5REXJdJa_VM'}
     r = requests.get(base_url + product_students_url, params=data, headers=headers)
     students = json.loads(r.content)
-    print(students)
-    for stu in students:
-        # 打印目前查到的课程，添加计划任务stu['schoolStudent']
-        base_stu = Student(stu['schoolStudent']['studentName'], stu['schoolStudent']['id'])
-        # 打印目前查到的课程，添加计划任务
-        print('学员考勤名单')
-        print('学生姓名：%s 学生Face：%s' % (base_stu.name, base_stu.face))
-        print('-'*20)
-        # 当前记录所有学生的脸部数据； 用于启动班级人脸考勤后的人脸对比；
-        known_face_encodings.append(base_stu.face)
-        known_face_names.append(base_stu.name)
+    print('学员考勤名单')
+
+    dict_students = []
+    dict_students_face = []
+    # 测试数据
+    dict_students.append('张扬')
+    dict_students_face.append([-0.15581109 ,0.05472353 ,0.07025001 ,-0.03478277 ,-0.1225464  ,-0.067148
+ ,-0.04389102 ,-0.1788922  ,0.12924638 ,-0.13846681 ,0.19092084 ,-0.08122106
+ ,-0.17738664 ,-0.07762139 ,-0.04714717 ,0.15356822 ,-0.11676171 ,-0.17608058
+ ,-0.04891798 ,-0.00277308 ,0.08459656 ,-0.02672651 ,0.02233794 ,0.02675597
+ ,-0.12284711 ,-0.32423082 ,-0.06693836 ,-0.03330912 ,0.0370509  ,-0.00095372
+ ,-0.037985   ,0.08953559 ,-0.24225864 ,-0.06567553 ,0.00651651 ,0.07766151
+ ,0.0249553  ,-0.04690952 ,0.16115598 ,-0.03531392 ,-0.2754212  ,-0.00158843
+ ,0.048085   ,0.2217226  ,0.1728704  ,0.03510183 ,0.03582369 ,-0.14219961
+ ,0.13848777 ,-0.15398261 ,0.00651219 ,0.13421679 ,0.03736773 ,-0.00163173
+ ,0.00824203 ,-0.15828934 ,0.03566626 ,0.09645136 ,-0.10309847 ,0.03537229
+ ,0.10742516 ,-0.05479398 ,-0.03489756 ,-0.12615083 ,0.22970793 ,0.03928682
+ ,-0.10161316 ,-0.152999   ,0.14209804 ,-0.11457364 ,-0.04976563 ,0.04947362
+ ,-0.17679501 ,-0.16622965 ,-0.32321617 ,-0.01142678 ,0.39683309 ,0.09516249
+ ,-0.18623924 ,0.08498649 ,-0.03429099 ,0.0539407  ,0.13747117 ,0.1810905
+ ,-0.00931429 ,0.06738873 ,-0.070461   ,-0.02259749 ,0.23196349 ,-0.02541499
+ ,-0.04351148 ,0.21511103 ,0.00179936 ,0.04083151 ,0.01450604 ,0.00452439
+ ,-0.08403969 ,0.00656004 ,-0.15078424 ,-0.01985493 ,0.02659354 ,-0.00236686
+ ,0.00856806 ,0.13737226 ,-0.14282063 ,0.12214312 ,-0.02238862 ,0.09799347
+ ,0.00912961 ,-0.0087376  ,-0.05622048 ,-0.06681822 ,0.05815097 ,-0.18055841
+ ,0.16614303 ,0.15774544 ,0.07016143 ,0.11707322 ,0.14276291 ,0.07293998
+ ,0.01899813 ,0.08238558 ,-0.1801544  ,-0.03088881 ,0.11364438 ,-0.07084202
+ ,0.0956964  ,0.0301157 ])
+
+    # for stu in students:
+    #     # 打印目前查到的课程，添加计划任务stu['schoolStudent']
+    #     base_stu = Student(stu['schoolStudent']['studentName'], stu['schoolStudent']['id'])
+    #     # 打印目前查到的课程，添加计划任务
+    #     print('学生姓名：%s 学生Face：%s' % (base_stu.name, base_stu.face))
+    #     # 当前记录所有学生的脸部数据； 用于启动班级人脸考勤后的人脸对比；
+    #     # known_face_encodings.append(base_stu.face)
+    #     # known_face_names.append(base_stu.name)
+    #     dict_students.append(base_stu.name)
+    # print('-' * 20)
+    print(dict_students, dict_students_face)
+    return dict_students, dict_students_face
 
 
-face_locations = []
-face_encodings = []
-face_names = []
-process_this_frame = True
+def save_cam_video(ip, cam_name, username, password, pro_name, base_product_id):
+    print('保存视频任务：Task for %s time: %s' % (cam_name, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    url = 'rtsp://%s:%s@%s:554/h264/ch1/main/av_stream' % (username, password, ip)
+    # url = "rtsp://admin:ADTVKL@192.168.8.216:554/h264/ch1/main/av_stream"
+    cap = cv2.VideoCapture(url)
 
-
-# 启动摄像头，录像并做人脸识别，成功后考勤登记
-def check_face_sign(ip, username, password, pro_name):
-
-    print('Task for %s' % pro_name)
-    source = "×××××"  # 摄像头的rtsp地址
-    # cam = cv2.VideoCapture(source)
-    # 本机摄像头
-    cam = cv2.VideoCapture(0)
-
-    while (cam.isOpened()):
-        # 读取摄像头画面
-        ret, frame = cam.read()
-        print(ret)
-        if not ret:
-            # 等同于 if ret is not none
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    width = int(cap.get(3))
+    height = int(cap.get(4))
+    path = '%s%s_%s_%s.mp4' % (videos_path, datetime.datetime.now().strftime("%Y%m%d%H%M"),
+                               base_product_id, cam_name)
+    print(path)
+    out = cv2.VideoWriter(path, fourcc, 10.0, (width, height))
+    start_time = time.time()
+    time_set = 90
+    while cap.isOpened():
+        t1 = time.time() - start_time
+        ret, frame = cap.read()
+        if ret is True:
+            out.write(frame)
+            if (cv2.waitKey(1) & 0xFF == ord('q')) | (t1 > time_set):
+                break
+        else:
             print('%s %s 摄像头读取不到' % (pro_name, ip))
             break
-
-        # 改变摄像头图像的大小，图像小，所做的计算就少
-        small_frame = cv2.resize(frame, (0, 0), fx=0.33, fy=0.33)
-
-        # opencv的图像是BGR格式的，而我们需要是的RGB格式的，因此需要进行一个转换。
-        rgb_small_frame = small_frame[:, :, ::-1]
-
-        # Only process every other frame of video to save time
-        if process_this_frame:
-            # 根据encoding来判断是不是同一个人，是就输出true，不是为flase
-            face_locations = face_recognition.face_locations(rgb_small_frame)
-            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-            face_names = []
-            # 此处可能识别多张脸
-            for face_encoding in face_encodings:
-                # 默认为unknown, match人脸
-
-                matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.48)
-                # 阈值太低容易造成无法成功识别人脸，太高容易造成人脸识别混淆 默认阈值tolerance为0.6
-                # print(matches)
-                name = "Unknown"
-
-                # if match[0]:
-                #     name = "michong"
-                # If a match was found in known_face_encodings, just use the first one.
-                if True in matches:
-                    first_match_index = matches.index(True)
-                    name = known_face_names[first_match_index]
-
-                face_names.append(name)
-            print(face_names)
-
-        process_this_frame = not process_this_frame
-
-        # 将捕捉到的人脸显示出来
-        for (top, right, bottom, left), name in zip(face_locations, face_names):
-            # Scale back up face locations since the frame we detected in was scaled to 1/4 size
-            # 由于我们检测到的帧被缩放到1/4大小，所以要缩小面位置
-            top *= 3
-            right *= 3
-            bottom *= 3
-            left *= 3
-
-            # 矩形框
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-
-            # 引入ft2中的字体
-            # 加上标签
-            cv2.rectangle(frame, (left, bottom - 20), (right, bottom), (0, 0, 255), cv2.FILLED)
-            font = cv2.FONT_HERSHEY_DUPLEX
-            cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.8, (255, 255, 255), 1)
-
-            # frame = ft.draw_text(frame,(left + 6, bottom - 6), name, 1.0, (255, 255, 255))
-            # def draw_text(self, image, pos, text, text_size, text_color)
-        # Display
-
-        cv2.imshow('monitor', frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
 
 
-from os import listdir
+# 保存视频的时候最好每天记录1个Excel：
+# 当天时间.excel：班级名称、班级ID、上课时间、班级学生[]
+# 每天新增一个excel，第一次是新增，第二次是追加。
+def create_xlsx(app, classname, class_id, start_time, stus):
+    now_time = datetime.datetime.now().strftime("%Y-%m-%d ")
+    path = ('%s.xlsx' % now_time)
 
+    if os.path.isfile(path):
+        wb = app.books.open(path)
+        sht = wb.sheets['Sheet1']  # 实例化工作表
+        row = 'a%s' % (sht.used_range.shape[0] + 1)
+        str_students = ''
 
-def test():
-    starttime = time.time()
-    print('starttime: %s' % starttime)
-    # 摄像头的rtsp地址
-    source = "rtsp://[username]:[password]@[100.29.111.29]:[554]/[h264]/[ch1]/[main]/av_stream"
+        for stu in stus:
+            str_students = str_students + str(stu)
+        sht.range(row).value = [classname, class_id, start_time, str_students]
+    else:
+        wb = app.books.add()
+        sht = wb.sheets['Sheet1']  # 实例化工作表
+        sht.range('a1').value = [classname, class_id, start_time, stus]
 
-    # 本机摄像头
-    cam = cv2.VideoCapture(0);
-    # cam = cv2.VideoCapture(source)
-
-    # 已知人脸图片文件夹 注意 如果会员图片后缀不是jpg 需要进行修改
-    filepath = './face_photos'
-    filename_list = listdir(filepath)
-    known_face_names = []
-    known_face_encodings = []
-    a = 0
-
-    for filename in filename_list:  # 依次读入列表中的内容
-        a += 1
-        if filename.endswith('png'):  # 后缀名'jpg'匹对
-            known_face_names.append(filename[:-4])  # 把文件名字的后四位.jpg去掉获取人名
-            file_str = filepath + '/' + filename
-            a_images = face_recognition.load_image_file(file_str)
-            print(a_images.shape)
-            a_face_encoding = face_recognition.face_encodings(a_images)[0]
-            print(a_face_encoding.shape)
-            known_face_encodings.append(a_face_encoding)
-    print(known_face_names, a)
-
-    face_locations = []
-    face_encodings = []
-    face_names = []
-    process_this_frame = True
-
-    while (cam.isOpened()):
-        # 读取摄像头画面
-        ret, frame = cam.read()
-        if not ret:
-            # 等同于 if ret is not none
-            break
-
-        # 改变摄像头图像的大小，图像小，所做的计算就少
-        small_frame = cv2.resize(frame, (0, 0), fx=0.33, fy=0.33)
-
-        # opencv的图像是BGR格式的，而我们需要是的RGB格式的，因此需要进行一个转换。
-        rgb_small_frame = small_frame[:, :, ::-1]
-
-        # Only process every other frame of video to save time
-        if process_this_frame:
-            # 根据encoding来判断是不是同一个人，是就输出true，不是为flase
-            face_locations = face_recognition.face_locations(rgb_small_frame)
-            print(face_locations)
-            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-            face_names = []
-            for face_encoding in face_encodings:
-                # 默认为unknown
-                print(face_encoding.shape)
-                matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.48)
-                # 阈值太低容易造成无法成功识别人脸，太高容易造成人脸识别混淆 默认阈值tolerance为0.6
-                # print(matches)
-                name = "Unknown"
-
-                # if match[0]:
-                #     name = "michong"
-                # If a match was found in known_face_encodings, just use the first one.
-                if True in matches:
-                    first_match_index = matches.index(True)
-                    name = known_face_names[first_match_index]
-
-                face_names.append(name)
-            print(face_names)
-
-        process_this_frame = not process_this_frame
-
-        # 将捕捉到的人脸显示出来
-        for (top, right, bottom, left), name in zip(face_locations, face_names):
-            # Scale back up face locations since the frame we detected in was scaled to 1/4 size
-            # 由于我们检测到的帧被缩放到1/4大小，所以要缩小面位置
-            top *= 3
-            right *= 3
-            bottom *= 3
-            left *= 3
-
-            # 矩形框
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-
-            # 引入ft2中的字体
-            # 加上标签
-            cv2.rectangle(frame, (left, bottom - 20), (right, bottom), (0, 0, 255), cv2.FILLED)
-            font = cv2.FONT_HERSHEY_DUPLEX
-            cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.8, (255, 255, 255), 1)
-
-            # frame = ft.draw_text(frame,(left + 6, bottom - 6), name, 1.0, (255, 255, 255))
-            # def draw_text(self, image, pos, text, text_size, text_color)
-        # Display
-        endtime = time.time()
-        print('endTime: %s' % endtime)
-        if endtime - starttime > 1*10:
-            cam.release()
-            cv2.destroyAllWindows()
-
-        cv2.imshow('monitor', frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-
-
-def aps_test(x):
-    print('_'*10)
-    print(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), x)
-
-
-def test2():
-    starttime = time.time()
-    file_name = str(starttime)+'.txt'
-    print('file_name: %s' % file_name)
-    f = open(file_name, 'w')
-    f.close()
+    wb.save(path)  # 保存
+    return wb
 
 
 def my_listener(event):
@@ -393,8 +368,8 @@ def my_listener(event):
     else:
         print('The job worked :)')
 
-# 启动任务监听，监听成功、失败
-# scheduler = BlockingScheduler()
+
+# 启动任务监听，监听成功、失败-真实启动，每日早上7点半执行get_course_for_day
 # scheduler.add_listener(my_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 # scheduler.add_job(
 #     get_course_for_day,
@@ -405,19 +380,9 @@ def my_listener(event):
 # scheduler.print_jobs()
 # scheduler.start()
 
-# 临时启动
-# get_course_for_day()
-
-
-# scheduler = BlockingScheduler()
-# scheduler.configure(executors=executors, job_defaults=job_defaults)
+# 临时启动 执行一次 之后启动定时任务
+get_course_for_day()
 # scheduler.add_listener(my_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
-# scheduler.add_job(
-#     func=test2,
-#     trigger='interval',
-#     minutes=1
-# )
 # scheduler.print_jobs()
-# scheduler.start()
-
+scheduler.start()
 

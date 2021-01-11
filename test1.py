@@ -34,3 +34,18 @@ cv2.imshow('tuxiang', frame)
 cv2.waitKey(1)  # 刷新界面 不然只会呈现灰色
 print('运行时间{}'.format(time.time() - t))
 time.sleep(5)  # 暂停五秒  展示图片
+
+
+# a = 0
+#
+# for filename in filename_list:  # 依次读入列表中的内容
+#     a += 1
+#     if filename.endswith('mp4'):  # 后缀名'jpg'匹对
+#         known_face_names.append(filename[:-4])  # 把文件名字的后四位.jpg去掉获取人名
+#         file_str = videos_path + '/' + filename
+#         a_images = face_recognition.load_image_file(file_str)
+#         print(a_images.shape)
+#         a_face_encoding = face_recognition.face_encodings(a_images)[0]
+#         print(a_face_encoding.shape)
+#         known_face_encodings.append(a_face_encoding)
+# print(known_face_names, a)
